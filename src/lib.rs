@@ -41,11 +41,7 @@ pub mod chat_template;
 pub mod discovery;
 pub mod error;
 pub mod manifest;
-pub mod mock_backend;
 pub mod registry;
-
-#[cfg(feature = "llama")]
-pub mod llama_backend;
 
 // ---------------------------------------------------------------------------
 // Re-exports: backend types
@@ -75,7 +71,7 @@ pub use error::InferError;
 // Re-exports: mock backend
 // ---------------------------------------------------------------------------
 
-pub use mock_backend::{MockBackend, MockConfig};
+pub use backend::mock::{MockBackend, MockConfig};
 
 // ---------------------------------------------------------------------------
 // Re-exports: model registry
@@ -88,4 +84,4 @@ pub use registry::{ModelInfo, ModelRegistry, Quantization};
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "llama")]
-pub use llama_backend::LlamaBackend;
+pub use backend::llama::LlamaBackend;

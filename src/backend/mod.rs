@@ -7,6 +7,9 @@
 use std::path::Path;
 use std::sync::mpsc;
 
+pub mod llama;
+pub mod mock;
+
 use crate::error::InferError;
 
 /// Compute backend type for model inference.

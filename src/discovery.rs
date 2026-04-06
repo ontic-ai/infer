@@ -84,14 +84,14 @@ pub fn auto_backend(
 ) -> Result<Box<dyn InferenceBackend + Send + Sync>, InferError> {
     #[cfg(feature = "llama")]
     {
-        let mut backend = crate::llama_backend::LlamaBackend::new()?;
+        let mut backend = crate::backend::llama::LlamaBackend::new()?;
         backend.load_model(model_path, backend_type)?;
         Ok(Box::new(backend))
     }
 
     #[cfg(not(feature = "llama"))]
     {
-        let mut backend = crate::mock_backend::MockBackend::new();
+        let mut backend = crate::backend::mock::MockBackend::new();
         backend.load_model(model_path, backend_type)?;
         Ok(Box::new(backend))
     }
