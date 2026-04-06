@@ -1,0 +1,50 @@
+name: Rust
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features", ""]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Clippy
+        run: cargo clippy ${{ matrix.features }} -- -D warnings
+
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - features: "--no-default-features"
+            name: "no-default-features"
+          - features: ""
+            name: "default-features (llama)"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ toolchain
+        if: matrix.name == 'default-features (llama)'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Build
+        run: cargo build --verbose ${{ matrix.features }}
+      - name: Run tests
+        run: cargo test --verbose ${{ matrix.features }}
