@@ -85,3 +85,5 @@ pub use registry::{ModelInfo, ModelRegistry, Quantization};
 
 #[cfg(feature = "llama")]
 pub use backend::llama::LlamaBackend;
+#[cfg(feature = "llama")]
+pub use backend::llama::suppress_logs as suppress_llama_logs;

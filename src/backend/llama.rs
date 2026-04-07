@@ -6,11 +6,10 @@
 //! on the same process share that global initialization.
 //!
 //! This module is only compiled when the `llama` feature is enabled.
-#![cfg(feature = "llama")]
 
-use std::mem::ManuallyDrop;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use encoding_rs::UTF_8;
@@ -28,33 +27,47 @@ use crate::error::InferError;
 // Global runtime initialization
 // ---------------------------------------------------------------------------
 
-/// Result of the one-time llama.cpp backend initialization.
+/// Log-suppression flag set by [`suppress_logs`].
 ///
-/// Stores `Ok(())` on success or the error message on failure. Subsequent
-/// callers re-use the same result without re-initializing.
-static RUNTIME_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+/// When `true`, [`ensure_runtime`] calls [`void_logs`](LlamaCppBackend::void_logs)
+/// on the backend during initialization. Must be set before the first call to
+/// [`ensure_runtime`].
+static SUPPRESS_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Globally-owned llama.cpp backend, initialized exactly once.
+///
+/// Stores the live [`LlamaCppBackend`] on success or the error message on
+/// failure. The value lives for the entire program lifetime via the `'static`
+/// [`OnceLock`].
+static RUNTIME: OnceLock<Result<LlamaCppBackend, String>> = OnceLock::new();
+
+/// Suppress all llama.cpp stderr log output.
+///
+/// Must be called **before** the first [`LlamaBackend::new()`] call (or before
+/// any other operation that triggers backend initialization). Calls after the
+/// backend has already been initialized have no effect.
+pub fn suppress_logs() {
+    SUPPRESS_LOGS.store(true, Ordering::Relaxed);
+}
 
 /// Ensure the llama.cpp C runtime is initialized exactly once.
 ///
-/// Returns a [`ManuallyDrop<LlamaCppBackend>`] "proof token" that can be
-/// passed (by reference) to `LlamaModel::load_from_file` and
-/// `LlamaModel::new_context`. We must never drop the underlying
-/// `LlamaCppBackend` value, because its `Drop` impl resets the global
-/// initialized flag, which would make all further API calls unsafe.
-fn ensure_runtime() -> Result<ManuallyDrop<LlamaCppBackend>, InferError> {
-    RUNTIME_INIT.get_or_init(|| {
+/// Returns a `'static` reference to the globally-owned [`LlamaCppBackend`].
+/// The reference is valid for the entire program lifetime.
+fn ensure_runtime() -> Result<&'static LlamaCppBackend, InferError> {
+    let result = RUNTIME.get_or_init(|| {
         LlamaCppBackend::init()
-            .map(std::mem::forget) // forget: see doc comment above
+            .map(|mut b| {
+                if SUPPRESS_LOGS.load(Ordering::Relaxed) {
+                    b.void_logs();
+                }
+                b
+            })
             .map_err(|e| e.to_string())
     });
-
-    match RUNTIME_INIT.get() {
-        Some(Ok(())) => Ok(ManuallyDrop::new(LlamaCppBackend {})),
-        Some(Err(msg)) => Err(InferError::BackendUnavailable(format!(
-            "llama.cpp runtime init failed: {msg}"
-        ))),
-        None => unreachable!("OnceLock::get_or_init guarantees the value is set"),
-    }
+    result
+        .as_ref()
+        .map_err(|e| InferError::BackendUnavailable(format!("llama.cpp runtime init failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +135,7 @@ impl InferenceBackend for LlamaBackend {
         let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
         let model =
-            LlamaModel::load_from_file(&runtime, model_path, &model_params).map_err(|e| {
+            LlamaModel::load_from_file(runtime, model_path, &model_params).map_err(|e| {
                 InferError::ModelLoadFailure(format!(
                     "failed to load {}: {e}",
                     model_path.display()
@@ -162,7 +175,7 @@ impl InferenceBackend for LlamaBackend {
             .map_err(|_| InferError::InferenceFailure("model mutex poisoned".into()))?;
         let model = guard.as_ref().ok_or(InferError::BackendNotInitialized)?;
         let runtime = ensure_runtime()?;
-        run_complete(model, &runtime, params)
+        run_complete(model, runtime, params)
     }
 
     /// Stream a text completion token by token.
@@ -186,7 +199,7 @@ impl InferenceBackend for LlamaBackend {
             .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
         let ctx_params = LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz));
         let mut ctx = model
-            .new_context(&runtime, ctx_params)
+            .new_context(runtime, ctx_params)
             .map_err(|e| InferError::StreamingFailure(format!("context init: {e}")))?;
 
         let tokens_list = model
@@ -208,7 +221,7 @@ impl InferenceBackend for LlamaBackend {
             )));
         }
 
-        let mut batch = LlamaBatch::new(512, 1);
+        let mut batch = LlamaBatch::new(tokens_list.len(), 1);
         let last_index = n_tokens - 1;
         for (i, &token) in tokens_list.iter().enumerate() {
             let is_last = i as i32 == last_index;
@@ -338,7 +351,7 @@ fn run_complete(
         )));
     }
 
-    let mut batch = LlamaBatch::new(512, 1);
+    let mut batch = LlamaBatch::new(tokens_list.len(), 1);
     let last_index = n_tokens - 1;
     for (i, &token) in tokens_list.iter().enumerate() {
         let is_last = i as i32 == last_index;

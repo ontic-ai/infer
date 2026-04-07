@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::mpsc;
 
+#[cfg(feature = "llama")]
 pub mod llama;
 pub mod mock;
 
