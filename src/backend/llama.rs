@@ -129,7 +129,7 @@ impl InferenceBackend for LlamaBackend {
         let runtime = ensure_runtime()?;
 
         let n_gpu_layers: u32 = match backend_type {
-            BackendType::Metal | BackendType::Cuda => 1000, // offload all layers
+            BackendType::Metal | BackendType::Cuda | BackendType::Vulkan => 1000, // offload all layers
             BackendType::Cpu => 0,
         };
         let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);

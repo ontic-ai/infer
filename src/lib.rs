@@ -29,11 +29,13 @@
 //!
 //! # Feature flags
 //!
-//! | Feature | Default | Description |
-//! |---------|---------|-------------|
-//! | `llama` | ✓ | Enable llama-cpp-2 backend (GGUF inference) |
-//! | `cuda`  |   | Enable NVIDIA CUDA GPU offloading (implies `llama`) |
-//! | `metal` |   | Enable Apple Metal GPU offloading — macOS only (implies `llama`) |
+//! | Feature  | Default | Description |
+//! |----------|---------|-------------|
+//! | `llama`  |         | Enable llama-cpp-2 backend (GGUF inference) |
+//! | `vulkan` |         | Enable Vulkan GPU offloading — Windows/Linux, cross-vendor (implies `llama`) |
+//! | `cuda`   |         | Enable NVIDIA CUDA GPU offloading — opt-in legacy (implies `llama`) |
+//! | `metal`  |         | Enable Apple Metal GPU offloading — macOS only (implies `llama`) |
+//! | (none)   | ✓       | CPU fallback — no features required; uses `MockBackend` without `llama` |
 
 // Module declarations
 pub mod backend;

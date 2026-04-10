@@ -18,7 +18,9 @@ use crate::error::InferError;
 pub enum BackendType {
     /// Apple Metal (macOS, Apple Silicon).
     Metal,
-    /// NVIDIA CUDA (Windows / Linux).
+    /// Vulkan GPU (Windows / Linux, cross-vendor: NVIDIA / AMD / Intel).
+    Vulkan,
+    /// NVIDIA CUDA (Windows / Linux, opt-in legacy).
     Cuda,
     /// CPU fallback (all platforms).
     Cpu,
@@ -28,27 +30,26 @@ impl BackendType {
     /// Auto-detect the best available backend for the current platform.
     ///
     /// Detection logic (lightweight, non-blocking):
-    /// - macOS → [`BackendType::Metal`]
-    /// - Windows with `nvcuda.dll` present → [`BackendType::Cuda`]
-    /// - Linux with `/proc/driver/nvidia/version` present → [`BackendType::Cuda`]
-    /// - Otherwise → [`BackendType::Cpu`]
+    ///
+    /// | Priority | Platform        | Condition |
+    /// |----------|-----------------|--------------------------------------------------|
+    /// | 1        | macOS           | `metal` feature compiled in |
+    /// | 2        | Windows + Linux | `vulkan` feature compiled in **and** Vulkan loader present |
+    /// | 3        | Windows + Linux | `cuda` feature compiled in **and** NVIDIA driver present |
+    /// | 4        | All             | Always available |
     pub fn auto_detect() -> Self {
         #[cfg(target_os = "macos")]
-        let result = BackendType::Metal;
+        let result = if cfg!(feature = "metal") {
+            BackendType::Metal
+        } else {
+            BackendType::Cpu
+        };
 
         #[cfg(target_os = "windows")]
-        let result = if has_nvidia_gpu_windows() {
-            BackendType::Cuda
-        } else {
-            BackendType::Cpu
-        };
+        let result = detect_gpu_backend_windows();
 
         #[cfg(target_os = "linux")]
-        let result = if has_nvidia_gpu_linux() {
-            BackendType::Cuda
-        } else {
-            BackendType::Cpu
-        };
+        let result = detect_gpu_backend_linux();
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         let result = BackendType::Cpu;
@@ -57,8 +58,62 @@ impl BackendType {
     }
 }
 
-/// Detect NVIDIA GPU on Windows by checking for the CUDA driver DLL.
+/// Select the best GPU backend on Windows.
+///
+/// Priority: Vulkan (if feature + loader) → CUDA (if feature + driver) → CPU.
 #[cfg(target_os = "windows")]
+fn detect_gpu_backend_windows() -> BackendType {
+    #[cfg(feature = "vulkan")]
+    if has_vulkan_windows() {
+        return BackendType::Vulkan;
+    }
+    #[cfg(feature = "cuda")]
+    if has_nvidia_gpu_windows() {
+        return BackendType::Cuda;
+    }
+    BackendType::Cpu
+}
+
+/// Select the best GPU backend on Linux.
+///
+/// Priority: Vulkan (if feature + loader) → CUDA (if feature + driver) → CPU.
+#[cfg(target_os = "linux")]
+fn detect_gpu_backend_linux() -> BackendType {
+    #[cfg(feature = "vulkan")]
+    if has_vulkan_linux() {
+        return BackendType::Vulkan;
+    }
+    #[cfg(feature = "cuda")]
+    if has_nvidia_gpu_linux() {
+        return BackendType::Cuda;
+    }
+    BackendType::Cpu
+}
+
+/// Detect Vulkan loader on Windows by checking for `vulkan-1.dll` in System32.
+#[cfg(all(target_os = "windows", feature = "vulkan"))]
+fn has_vulkan_windows() -> bool {
+    let system32 = std::env::var("SystemRoot")
+        .map(|root| std::path::PathBuf::from(root).join("System32"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(r"C:\Windows\System32"));
+    system32.join("vulkan-1.dll").exists()
+}
+
+/// Detect Vulkan loader on Linux by checking well-known library paths.
+#[cfg(all(target_os = "linux", feature = "vulkan"))]
+fn has_vulkan_linux() -> bool {
+    [
+        "/usr/lib/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
+}
+
+/// Detect NVIDIA CUDA driver on Windows by checking for `nvcuda.dll` in System32.
+#[cfg(all(target_os = "windows", feature = "cuda"))]
 fn has_nvidia_gpu_windows() -> bool {
     let system32 = std::env::var("SystemRoot")
         .map(|root| std::path::PathBuf::from(root).join("System32"))
@@ -67,7 +122,7 @@ fn has_nvidia_gpu_windows() -> bool {
 }
 
 /// Detect NVIDIA GPU on Linux by checking for the NVIDIA driver proc entry.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "cuda"))]
 fn has_nvidia_gpu_linux() -> bool {
     std::path::Path::new("/proc/driver/nvidia/version").exists()
 }
@@ -76,6 +131,7 @@ impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BackendType::Metal => write!(f, "Metal"),
+            BackendType::Vulkan => write!(f, "Vulkan"),
             BackendType::Cuda => write!(f, "CUDA"),
             BackendType::Cpu => write!(f, "CPU"),
         }
@@ -166,7 +222,7 @@ pub trait InferenceBackend: Send + Sync + 'static {
     /// Load model weights from the GGUF file at `model_path`.
     ///
     /// `backend_type` controls GPU offloading:
-    /// - [`BackendType::Metal`] / [`BackendType::Cuda`] → full GPU offload
+    /// - [`BackendType::Metal`] / [`BackendType::Vulkan`] / [`BackendType::Cuda`] → full GPU offload
     /// - [`BackendType::Cpu`] → CPU-only inference
     fn load_model(
         &mut self,
@@ -239,7 +295,7 @@ mod tests {
     #[test]
     fn auto_detect_returns_valid_variant() {
         match BackendType::auto_detect() {
-            BackendType::Metal | BackendType::Cuda | BackendType::Cpu => {}
+            BackendType::Vulkan | BackendType::Metal | BackendType::Cuda | BackendType::Cpu => {}
         }
     }
 

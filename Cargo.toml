@@ -11,11 +11,14 @@ keywords = ["llm", "inference", "llama", "ai", "gguf"]
 categories = ["science"]
 
 [features]
-## Default feature set enables the llama-cpp-2 backend.
-default = ["llama"]
+## No GPU feature is enabled by default; CPU is the zero-config fallback.
+## Use --features llama for CPU-only real inference, or --features vulkan/cuda/metal for GPU.
+default = []
 ## Enable the llama-cpp-2 backend (GGUF model loading and inference).
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
-## Enable NVIDIA CUDA GPU acceleration (implies `llama`).
+## Enable Vulkan GPU acceleration — Windows and Linux, preferred cross-vendor GPU path (implies `llama`).
+vulkan = ["llama", "llama-cpp-2/vulkan"]
+## Enable NVIDIA CUDA GPU acceleration — opt-in legacy path (implies `llama`).
 cuda = ["llama", "llama-cpp-2/cuda"]
 ## Enable Apple Metal GPU acceleration — macOS only (implies `llama`).
 metal = ["llama", "llama-cpp-2/metal"]
@@ -27,7 +30,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-llama-cpp-2 = { version = "0.1", optional = true }
+llama-cpp-2 = { version = "0.1.143", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 
 [dev-dependencies]

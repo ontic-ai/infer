@@ -38,9 +38,18 @@ println!("{}", response);
 
 ## Features
 
-- `llama` (default): enable the `llama-cpp-2` backend.
-- `cuda`: enable CUDA GPU offloading for supported models.
-- `metal`: enable Apple Metal GPU offloading on macOS.
+No features are enabled by default. CPU is the zero-config fallback (uses `MockBackend`
+without the `llama` feature).
+
+| Feature  | Backend                  | Requirement |
+|----------|--------------------------|-------------|
+| (none)   | CPU (MockBackend)        | None — compiles everywhere |
+| `llama`  | CPU (real llama.cpp)     | C/C++ toolchain + clang (for bindgen) |
+| `vulkan` | Vulkan GPU               | implies `llama`; Vulkan SDK + `VULKAN_SDK` env var on Windows |
+| `cuda`   | CUDA GPU (legacy opt-in) | implies `llama`; CUDA toolkit installed |
+| `metal`  | Metal GPU                | implies `llama`; macOS only |
+
+See [BUILDING.md](BUILDING.md) for platform-specific build instructions.
 
 ## Structure
 
