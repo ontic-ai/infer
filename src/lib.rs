@@ -42,6 +42,7 @@ pub mod backend;
 pub mod chat_template;
 pub mod discovery;
 pub mod error;
+pub mod kv_quant;
 pub mod manifest;
 pub mod registry;
 
@@ -50,6 +51,7 @@ pub mod registry;
 // ---------------------------------------------------------------------------
 
 pub use backend::{BackendError, BackendType, ExtractionResult, InferenceBackend, InferenceParams};
+pub use kv_quant::{KvCacheConfig, KvQuantization};
 
 // ---------------------------------------------------------------------------
 // Re-exports: chat template
@@ -85,6 +87,8 @@ pub use registry::{ModelInfo, ModelRegistry, Quantization};
 // Re-exports: llama backend (feature-gated)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "llama")]
+pub use backend::embed::LlamaEmbedBackend;
 #[cfg(feature = "llama")]
 pub use backend::llama::LlamaBackend;
 #[cfg(feature = "llama")]

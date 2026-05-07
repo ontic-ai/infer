@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file.
 
 - No current unreleased changes.
 
+## [0.2.0] - 2026-05-06
+
+- Added native KV cache quantization API: `KvCacheConfig`, `KvQuantization`.
+- Implemented CPU reference kernels for Planar2/Planar3 (2D Givens) and Iso4/Iso3 (4D quaternion) with Lloyd-Max scalar quantization.
+- Added pure Rust KV quantization pipeline with compression/decompression round-trip tests.
+- Added Vulkan-gated shader assets and build-time GLSL -> SPIR-V compilation pipeline.
+- Added `InferenceParams::kv_cache` (default `KvCacheConfig::none()`) for backward-compatible per-request configuration.
+- Added `LlamaBackend::with_kv_cache(KvCacheConfig)` and per-request KV cache dtype mapping via llama.cpp context params.
+- Added precomputed Lloyd-Max centroids for 2/3/4-bit scalar quantization.
+
 ## [0.1.2] - 2026-04-09
 
 - Added Vulkan GPU backend support for Windows and Linux.

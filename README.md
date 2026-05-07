@@ -51,6 +51,22 @@ without the `llama` feature).
 
 See [BUILDING.md](BUILDING.md) for platform-specific build instructions.
 
+## KV Cache Quantization
+
+The crate exposes KV cache quantization controls through `KvCacheConfig` and
+`KvQuantization`:
+
+- `None`: no KV compression (FP16 K/V)
+- `Planar2`: 2D Givens + 2-bit Lloyd-Max, near-zero quality impact
+- `Planar3`: 2D Givens + 3-bit Lloyd-Max, higher compression with modest quality drop
+- `Iso4`: 4D quaternion + 4-bit Lloyd-Max, better quality than `Planar3`
+- `Iso3`: 4D quaternion + 3-bit Lloyd-Max, best quality-per-bit in this set
+
+Reference benchmark guidance used by docs:
+
+- Deferred-K (`k=Planar3, v=None`): around 5x K-cache compression with near-zero PPL loss
+- Symmetric 3-bit (`k=Iso3, v=Iso3`): around 10.3x KV compression with ~4.2% PPL increase
+
 ## Structure
 
 The crate exposes a single root module and keeps backend implementations

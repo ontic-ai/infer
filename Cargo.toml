@@ -1,6 +1,6 @@
 [package]
 name = "infer"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Ontic AI <dev@ontic.ai>"]
 license = "MIT"
@@ -33,6 +33,14 @@ uuid = { version = "1", features = ["v4"] }
 llama-cpp-2 = { version = "0.1.143", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 
+[build-dependencies]
+shaderc = "0.8"
+
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "kv_quant"
+harness = false

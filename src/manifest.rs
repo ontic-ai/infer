@@ -235,9 +235,8 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         write_manifest(tmp.path(), "noblob", "latest", "sha256:gone");
         // no blob created
-        match parse_ollama_manifests(tmp.path()) {
-            Ok(models) => assert_eq!(models.len(), 0),
-            Err(_) => {} // also acceptable
+        if let Ok(models) = parse_ollama_manifests(tmp.path()) {
+            assert_eq!(models.len(), 0);
         }
     }
 

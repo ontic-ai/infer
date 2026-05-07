@@ -56,6 +56,10 @@ cargo build --features vulkan
 cargo build --features vulkan
 ```
 
+`infer` now compiles KV quantization Vulkan compute shaders (`planar_rotate.glsl`,
+`iso_rotate.glsl`) to SPIR-V at build time via `build.rs` when the `vulkan`
+feature is enabled.
+
 ### Runtime detection
 
 `BackendType::auto_detect()` returns `BackendType::Vulkan` when the `vulkan`

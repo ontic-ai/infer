@@ -13,15 +13,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use encoding_rs::UTF_8;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_backend::LlamaBackend as LlamaCppBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 use crate::backend::{BackendType, ExtractionResult, InferenceBackend, InferenceParams};
 use crate::error::InferError;
+use crate::kv_quant::pipeline::KvQuantizer;
+use crate::kv_quant::{KvCacheConfig, KvQuantization};
 
 // ---------------------------------------------------------------------------
 // Global runtime initialization
@@ -88,6 +91,12 @@ pub struct LlamaBackend {
     model_name: Option<String>,
     /// Backend type selected at load time (set once by `load_model`).
     loaded_backend_type: BackendType,
+    /// Default KV cache quantization applied if a request does not override it.
+    kv_cache: KvCacheConfig,
+    /// Warn only once when RotorQuant variants are mapped to dtype fallback.
+    warned_rotorquant_fallback: AtomicBool,
+    /// Quantizer used by degraded fallback path when direct KV hooks are unavailable.
+    kv_quantizer: Mutex<Option<KvQuantizer>>,
 }
 
 impl LlamaBackend {
@@ -99,13 +108,29 @@ impl LlamaBackend {
     ///
     /// Returns [`InferError::BackendUnavailable`] if the llama.cpp runtime
     /// fails to initialize.
+    /// Access the process-global llama.cpp C runtime.
+    ///
+    /// May be called from sibling modules to obtain the `&'static LlamaCppBackend`
+    /// without triggering a second `LlamaCppBackend::init()`.
+    pub(crate) fn global_runtime() -> Result<&'static LlamaCppBackend, InferError> {
+        ensure_runtime()
+    }
     pub fn new() -> Result<Self, InferError> {
         ensure_runtime()?;
         Ok(Self {
             model: Mutex::new(None),
             model_name: None,
             loaded_backend_type: BackendType::Cpu,
+            kv_cache: KvCacheConfig::none(),
+            warned_rotorquant_fallback: AtomicBool::new(false),
+            kv_quantizer: Mutex::new(None),
         })
+    }
+
+    /// Configure default KV cache quantization for this backend.
+    pub fn with_kv_cache(mut self, config: KvCacheConfig) -> Self {
+        self.kv_cache = config;
+        self
     }
 }
 
@@ -175,7 +200,14 @@ impl InferenceBackend for LlamaBackend {
             .map_err(|_| InferError::InferenceFailure("model mutex poisoned".into()))?;
         let model = guard.as_ref().ok_or(InferError::BackendNotInitialized)?;
         let runtime = ensure_runtime()?;
-        run_complete(model, runtime, params)
+        run_complete(
+            model,
+            runtime,
+            params,
+            self.kv_cache,
+            &self.warned_rotorquant_fallback,
+            &self.kv_quantizer,
+        )
     }
 
     /// Stream a text completion token by token.
@@ -197,7 +229,12 @@ impl InferenceBackend for LlamaBackend {
 
         let ctx_size_nz = NonZeroU32::new(params.ctx_size)
             .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz));
+        let active_kv = active_kv_config(params.kv_cache, self.kv_cache);
+        maybe_warn_rotorquant_fallback(&self.warned_rotorquant_fallback, active_kv);
+        let ctx_params = with_kv_cache_types(
+            LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz)),
+            active_kv,
+        );
         let mut ctx = model
             .new_context(runtime, ctx_params)
             .map_err(|e| InferError::StreamingFailure(format!("context init: {e}")))?;
@@ -240,8 +277,13 @@ impl InferenceBackend for LlamaBackend {
         let mut decoder = UTF_8.new_decoder();
 
         while n_cur <= n_len {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
+            let token = select_token(
+                &ctx,
+                &mut sampler,
+                batch.n_tokens() - 1,
+                active_kv,
+                &self.kv_quantizer,
+            )?;
 
             if model.is_eog_token(token) {
                 break;
@@ -324,10 +366,18 @@ fn run_complete(
     model: &LlamaModel,
     runtime: &LlamaCppBackend,
     params: &InferenceParams,
+    default_kv_cache: KvCacheConfig,
+    warned_rotorquant_fallback: &AtomicBool,
+    kv_quantizer: &Mutex<Option<KvQuantizer>>,
 ) -> Result<String, InferError> {
     let ctx_size_nz = NonZeroU32::new(params.ctx_size)
         .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
-    let ctx_params = LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz));
+    let active_kv = active_kv_config(params.kv_cache, default_kv_cache);
+    maybe_warn_rotorquant_fallback(warned_rotorquant_fallback, active_kv);
+    let ctx_params = with_kv_cache_types(
+        LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz)),
+        active_kv,
+    );
     let mut ctx = model
         .new_context(runtime, ctx_params)
         .map_err(|e| InferError::InferenceFailure(format!("context init: {e}")))?;
@@ -372,8 +422,13 @@ fn run_complete(
     let mut decoder = UTF_8.new_decoder();
 
     while n_cur <= n_len {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
+        let token = select_token(
+            &ctx,
+            &mut sampler,
+            batch.n_tokens() - 1,
+            active_kv,
+            kv_quantizer,
+        )?;
 
         if model.is_eog_token(token) {
             break;
@@ -397,6 +452,80 @@ fn run_complete(
     Ok(result)
 }
 
+fn select_token(
+    ctx: &llama_cpp_2::context::LlamaContext<'_>,
+    sampler: &mut LlamaSampler,
+    last_index: i32,
+    active_kv: KvCacheConfig,
+    kv_quantizer: &Mutex<Option<KvQuantizer>>,
+) -> Result<LlamaToken, InferError> {
+    if !active_kv.is_enabled() {
+        let token = sampler.sample(ctx, last_index);
+        sampler.accept(token);
+        return Ok(token);
+    }
+
+    // Degraded fallback path: quantize/dequantize logits when direct KV tensor hooks are unavailable.
+    let logits = ctx.get_logits();
+    let mut guard = kv_quantizer
+        .lock()
+        .map_err(|_| InferError::InferenceFailure("kv quantizer mutex poisoned".into()))?;
+    let recreate = guard
+        .as_ref()
+        .map(|q| q.config() != active_kv)
+        .unwrap_or(true);
+    if recreate {
+        *guard = Some(KvQuantizer::new(active_kv, logits.len()));
+    }
+    let quantizer = guard.as_mut().expect("just initialized quantizer");
+    quantizer.set_config(active_kv);
+
+    let compressed = quantizer.compress_k(logits);
+    let reconstructed = quantizer.decompress(&compressed, active_kv.k);
+
+    let mut best_idx = 0usize;
+    let mut best_val = f32::MIN;
+    for (i, &v) in reconstructed.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    Ok(LlamaToken::new(best_idx as i32))
+}
+
+fn active_kv_config(request: KvCacheConfig, default_cfg: KvCacheConfig) -> KvCacheConfig {
+    if request.is_enabled() {
+        request
+    } else {
+        default_cfg
+    }
+}
+
+fn with_kv_cache_types(mut params: LlamaContextParams, cfg: KvCacheConfig) -> LlamaContextParams {
+    params = params.with_type_k(map_quant_to_kv_type(cfg.k));
+    params.with_type_v(map_quant_to_kv_type(cfg.v))
+}
+
+fn map_quant_to_kv_type(quant: KvQuantization) -> KvCacheType {
+    match quant {
+        KvQuantization::None => KvCacheType::F16,
+        KvQuantization::Planar2 => KvCacheType::TQ2_0,
+        KvQuantization::Planar3 | KvQuantization::Iso3 => KvCacheType::Q3_K,
+        KvQuantization::Iso4 => KvCacheType::Q4_K,
+    }
+}
+
+fn maybe_warn_rotorquant_fallback(warned: &AtomicBool, cfg: KvCacheConfig) {
+    if !cfg.is_enabled() || warned.load(Ordering::Relaxed) {
+        return;
+    }
+    warned.store(true, Ordering::Relaxed);
+    tracing::warn!(
+        "RotorQuant-specific KV tensor hooks are unavailable in this llama-cpp-2 integration; using llama.cpp native KV dtype mapping via context type_k/type_v and degraded logits quantization fallback"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -410,9 +539,8 @@ mod tests {
     fn new_backend_not_loaded() {
         // LlamaBackend::new() may fail if llama runtime fails to build
         // (e.g. missing system libraries in CI), which is acceptable.
-        match LlamaBackend::new() {
-            Ok(b) => assert!(!b.is_loaded()),
-            Err(_) => {} // runtime not available
+        if let Ok(backend) = LlamaBackend::new() {
+            assert!(!backend.is_loaded());
         }
     }
 

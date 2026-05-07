@@ -8,10 +8,13 @@ use std::path::Path;
 use std::sync::mpsc;
 
 #[cfg(feature = "llama")]
+pub mod embed;
+#[cfg(feature = "llama")]
 pub mod llama;
 pub mod mock;
 
 use crate::error::InferError;
+use crate::kv_quant::KvCacheConfig;
 
 /// Compute backend type for model inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +156,9 @@ pub struct InferenceParams {
     pub max_tokens: usize,
     /// Context window size in tokens.
     pub ctx_size: u32,
+    /// KV cache quantization applied during this inference call.
+    /// Defaults to no quantization (FP16 K and V).
+    pub kv_cache: KvCacheConfig,
 }
 
 impl Default for InferenceParams {
@@ -164,6 +170,7 @@ impl Default for InferenceParams {
             top_p: 0.9,
             max_tokens: 512,
             ctx_size: 2048,
+            kv_cache: KvCacheConfig::none(),
         }
     }
 }
