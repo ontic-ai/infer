@@ -31,6 +31,7 @@
 //!
 //! | Feature  | Default | Description |
 //! |----------|---------|-------------|
+//! | `turboquant` |         | Enable TurboQuant CPU/reference KV compression (pulls `turboquant` + `ort`) |
 //! | `llama`  |         | Enable llama-cpp-2 backend (GGUF inference) |
 //! | `vulkan` |         | Enable Vulkan GPU offloading — Windows/Linux, cross-vendor (implies `llama`) |
 //! | `cuda`   |         | Enable NVIDIA CUDA GPU offloading — opt-in legacy (implies `llama`) |
@@ -51,7 +52,9 @@ pub mod registry;
 // ---------------------------------------------------------------------------
 
 pub use backend::{BackendError, BackendType, ExtractionResult, InferenceBackend, InferenceParams};
-pub use kv_quant::{KvCacheConfig, KvQuantization};
+pub use kv_quant::{
+    KvCacheConfig, KvQuantization, RotorQuantization, TurboQuantStrategy, TurboQuantization,
+};
 
 // ---------------------------------------------------------------------------
 // Re-exports: chat template

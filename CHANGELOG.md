@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-11
+
+- Made the `turboquant` dependency opt-in behind a new `turboquant` feature so default `infer` builds no longer pull the conflicting `ort` graph.
+- Kept TurboQuant KV configuration types available in the public API while failing fast with a clear message if TurboQuant is requested without enabling the feature.
+
 ## [0.3.1] - 2026-05-11
 
 - Updated direct dependencies to the latest published releases for `tokio`, `uuid`, `llama-cpp-2`, `criterion`, and `shaderc`.

@@ -14,11 +14,10 @@
 //!   8. kv_buffered_decompress  — reusable-buffer decompress batch benches
 //!   9. kv_batch                — public-API batch throughput bench
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use infer::kv_quant::pipeline::{CompressedKv, KvQuantizer};
 use infer::kv_quant::rotation::{
@@ -103,10 +102,14 @@ fn make_iso_params(dim: usize) -> Vec<QuaternionParams> {
 
 /// All four quantization variants used in benchmarks (excludes `None`).
 const VARIANTS: &[(KvQuantization, &str)] = &[
-    (KvQuantization::Planar2, "Planar2"),
-    (KvQuantization::Planar3, "Planar3"),
-    (KvQuantization::Iso4, "Iso4"),
-    (KvQuantization::Iso3, "Iso3"),
+    (KvQuantization::planar2(), "Planar2"),
+    (KvQuantization::planar3(), "Planar3"),
+    (KvQuantization::iso4(), "Iso4"),
+    (KvQuantization::iso3(), "Iso3"),
+    #[cfg(feature = "turboquant")]
+    (KvQuantization::turbo_mse(4), "TurboMSE4"),
+    #[cfg(feature = "turboquant")]
+    (KvQuantization::turbo_prod(4), "TurboProd4"),
 ];
 
 fn make_quantizer(quant: KvQuantization, dim: usize) -> KvQuantizer {
@@ -139,7 +142,7 @@ fn bench_round_trip(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new(label, dim), &dim, |b, _| {
                 b.iter(|| {
                     let compressed = q.compress_k(black_box(&v));
-                    black_box(q.decompress(&compressed, quant))
+                    black_box(q.decompress(&compressed))
                 });
             });
         }
@@ -178,7 +181,7 @@ fn bench_decompress(c: &mut Criterion) {
             let compressed = pre_compress(quant, dim);
             group.throughput(Throughput::Elements(dim as u64));
             group.bench_with_input(BenchmarkId::new(label, dim), &dim, |b, _| {
-                b.iter(|| black_box(q.decompress(black_box(&compressed), quant)));
+                b.iter(|| black_box(q.decompress(black_box(&compressed))));
             });
         }
     }
@@ -232,7 +235,7 @@ fn bench_buffered_round_trip(c: &mut Criterion) {
                             black_box(&mut scratch[index]),
                             &mut compressed[index],
                         );
-                        q.decompress_into(&compressed[index], quant, &mut outputs[index]);
+                        q.decompress_into(&compressed[index], &mut outputs[index]);
                     }
                     black_box(&outputs);
                 });
@@ -289,7 +292,6 @@ fn bench_buffered_decompress(c: &mut Criterion) {
                     for index in 0..compressed.len() {
                         q.decompress_into(
                             black_box(&compressed[index]),
-                            quant,
                             black_box(&mut outputs[index]),
                         );
                     }
