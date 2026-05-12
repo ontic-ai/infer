@@ -4,7 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-- No current unreleased changes.
+## [0.3.0] - 2026-05-11
+
+- Added `InferenceParams::top_k`, `InferenceParams::repeat_penalty`, and `InferenceParams::stop_sequences` for explicit sampler and stop control.
+- Wired llama generation through a real sampler chain so temperature, top-k, top-p, and repeat penalty now affect completions and streams, including the degraded KV-quant fallback path.
+- Enforced stop-sequence truncation in both `complete()` and `stream()` and made streaming emit incrementally on background workers instead of buffering the full response first.
+- Set llama context `n_batch` and `n_ubatch` from the active context window to avoid prompt-decode `ubatch` assertions on long prompts.
+- Added algorithm-oriented KV quantization types: `KvQuantization`, `RotorQuantization`, `TurboQuantization`, and `TurboQuantStrategy`.
+- Added initial TurboQuant integration through the upstream `turboquant` crate in the CPU/reference KV pipeline.
+- Modularized `kv_quant` around generic compressed payloads so RotorQuant-style and TurboQuant algorithms share one pipeline surface.
+- Added TurboQuant benchmark variants and README use-case guidance, including the current llama.cpp support boundary.
 
 ## [0.2.0] - 2026-05-06
 

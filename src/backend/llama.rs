@@ -10,7 +10,8 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::thread;
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
@@ -19,8 +20,11 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::data::LlamaTokenData;
+use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use llama_cpp_2::token::LlamaToken;
 
+use super::stop::{StopOutcome, StopSequenceBuffer};
 use crate::backend::{BackendType, ExtractionResult, InferenceBackend, InferenceParams};
 use crate::error::InferError;
 use crate::kv_quant::pipeline::KvQuantizer;
@@ -86,7 +90,7 @@ fn ensure_runtime() -> Result<&'static LlamaCppBackend, InferError> {
 /// `Sync` and can be shared via `Arc<dyn InferenceBackend>`.
 pub struct LlamaBackend {
     /// The loaded GGUF model, or `None` before [`load_model`] is called.
-    model: Mutex<Option<LlamaModel>>,
+    model: Mutex<Option<Arc<LlamaModel>>>,
     /// Stem of the loaded model file path (set once by `load_model`).
     model_name: Option<String>,
     /// Backend type selected at load time (set once by `load_model`).
@@ -94,9 +98,9 @@ pub struct LlamaBackend {
     /// Default KV cache quantization applied if a request does not override it.
     kv_cache: KvCacheConfig,
     /// Warn only once when RotorQuant variants are mapped to dtype fallback.
-    warned_rotorquant_fallback: AtomicBool,
+    warned_rotorquant_fallback: Arc<AtomicBool>,
     /// Quantizer used by degraded fallback path when direct KV hooks are unavailable.
-    kv_quantizer: Mutex<Option<KvQuantizer>>,
+    kv_quantizer: Arc<Mutex<Option<KvQuantizer>>>,
 }
 
 impl LlamaBackend {
@@ -122,8 +126,8 @@ impl LlamaBackend {
             model_name: None,
             loaded_backend_type: BackendType::Cpu,
             kv_cache: KvCacheConfig::none(),
-            warned_rotorquant_fallback: AtomicBool::new(false),
-            kv_quantizer: Mutex::new(None),
+            warned_rotorquant_fallback: Arc::new(AtomicBool::new(false)),
+            kv_quantizer: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -177,7 +181,7 @@ impl InferenceBackend for LlamaBackend {
             .model
             .lock()
             .map_err(|_| InferError::InferenceFailure("model mutex poisoned".into()))? =
-            Some(model);
+            Some(Arc::new(model));
         Ok(())
     }
 
@@ -194,121 +198,83 @@ impl InferenceBackend for LlamaBackend {
     }
 
     fn complete(&self, params: &InferenceParams) -> Result<String, InferError> {
-        let guard = self
+        let model = self
             .model
             .lock()
-            .map_err(|_| InferError::InferenceFailure("model mutex poisoned".into()))?;
-        let model = guard.as_ref().ok_or(InferError::BackendNotInitialized)?;
+            .map_err(|_| InferError::InferenceFailure("model mutex poisoned".into()))?
+            .as_ref()
+            .cloned()
+            .ok_or(InferError::BackendNotInitialized)?;
         let runtime = ensure_runtime()?;
         run_complete(
-            model,
+            model.as_ref(),
             runtime,
             params,
             self.kv_cache,
-            &self.warned_rotorquant_fallback,
-            &self.kv_quantizer,
+            self.warned_rotorquant_fallback.as_ref(),
+            self.kv_quantizer.as_ref(),
         )
     }
 
     /// Stream a text completion token by token.
     ///
-    /// All tokens are generated inline (blocking) before the `Receiver` is
-    /// returned, so the caller receives a fully-buffered channel. Drop the
-    /// `Receiver` at any point to signal cancellation: the generation loop
-    /// detects the closed channel via `tx.send().is_err()` and stops cleanly.
+    /// Generation runs on a background thread. Drop the `Receiver` at any point
+    /// to signal cancellation: the generation loop detects the closed channel
+    /// via `tx.send().is_err()` and stops cleanly.
     fn stream(&self, params: InferenceParams) -> Result<mpsc::Receiver<String>, InferError> {
-        let guard = self
+        let model = self
             .model
             .lock()
-            .map_err(|_| InferError::StreamingFailure("model mutex poisoned".into()))?;
-        let model = guard.as_ref().ok_or(InferError::BackendNotInitialized)?;
+            .map_err(|_| InferError::StreamingFailure("model mutex poisoned".into()))?
+            .as_ref()
+            .cloned()
+            .ok_or(InferError::BackendNotInitialized)?;
         let runtime = ensure_runtime()
             .map_err(|e| InferError::StreamingFailure(format!("runtime unavailable: {e}")))?;
+        let warned_rotorquant_fallback = Arc::clone(&self.warned_rotorquant_fallback);
+        let kv_quantizer = Arc::clone(&self.kv_quantizer);
+        let default_kv_cache = self.kv_cache;
 
         let (tx, rx) = mpsc::channel::<String>();
 
-        let ctx_size_nz = NonZeroU32::new(params.ctx_size)
-            .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
-        let active_kv = active_kv_config(params.kv_cache, self.kv_cache);
-        maybe_warn_rotorquant_fallback(&self.warned_rotorquant_fallback, active_kv);
-        let ctx_params = with_kv_cache_types(
-            LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz)),
-            active_kv,
-        );
-        let mut ctx = model
-            .new_context(runtime, ctx_params)
-            .map_err(|e| InferError::StreamingFailure(format!("context init: {e}")))?;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
-        let tokens_list = model
-            .str_to_token(&params.prompt, AddBos::Always)
-            .map_err(|e| InferError::StreamingFailure(format!("tokenize: {e}")))?;
+        thread::Builder::new()
+            .name("infer-llama-stream".to_string())
+            .spawn(move || {
+                let mut ready_tx = Some(ready_tx);
+                let result = run_generation(
+                    model.as_ref(),
+                    runtime,
+                    &params,
+                    default_kv_cache,
+                    warned_rotorquant_fallback.as_ref(),
+                    kv_quantizer.as_ref(),
+                    || {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                    },
+                    |piece| tx.send(piece).is_ok(),
+                );
 
-        if tokens_list.is_empty() {
-            return Err(InferError::StreamingFailure("empty prompt".into()));
+                if let Err(err) = result {
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(err));
+                    } else {
+                        tracing::warn!("llama stream generation failed: {err}");
+                    }
+                }
+            })
+            .map_err(|e| InferError::StreamingFailure(format!("spawn: {e}")))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(rx),
+            Ok(Err(err)) => Err(InferError::StreamingFailure(err)),
+            Err(_) => Err(InferError::StreamingFailure(
+                "stream worker failed to initialize".into(),
+            )),
         }
-
-        let n_tokens = tokens_list.len() as i32;
-        let n_len = n_tokens + params.max_tokens as i32;
-        let n_ctx_val = params.ctx_size as i32;
-
-        if n_len > n_ctx_val {
-            return Err(InferError::StreamingFailure(format!(
-                "prompt ({n_tokens} tokens) + max_tokens ({}) exceeds context size ({n_ctx_val})",
-                params.max_tokens
-            )));
-        }
-
-        let mut batch = LlamaBatch::new(tokens_list.len(), 1);
-        let last_index = n_tokens - 1;
-        for (i, &token) in tokens_list.iter().enumerate() {
-            let is_last = i as i32 == last_index;
-            batch
-                .add(token, i as i32, &[0], is_last)
-                .map_err(|e| InferError::StreamingFailure(format!("batch add: {e}")))?;
-        }
-
-        ctx.decode(&mut batch)
-            .map_err(|e| InferError::StreamingFailure(format!("decode prompt: {e}")))?;
-
-        let mut n_cur = batch.n_tokens();
-        let seed = (params.request_id.as_u128() & 0xFFFF_FFFF) as u32;
-        let mut sampler =
-            LlamaSampler::chain_simple([LlamaSampler::dist(seed), LlamaSampler::greedy()]);
-        let mut decoder = UTF_8.new_decoder();
-
-        while n_cur <= n_len {
-            let token = select_token(
-                &ctx,
-                &mut sampler,
-                batch.n_tokens() - 1,
-                active_kv,
-                &self.kv_quantizer,
-            )?;
-
-            if model.is_eog_token(token) {
-                break;
-            }
-
-            let piece = model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| InferError::StreamingFailure(format!("token to piece: {e}")))?;
-
-            if tx.send(piece).is_err() {
-                break; // receiver dropped — cancellation
-            }
-
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| InferError::StreamingFailure(format!("batch add token: {e}")))?;
-
-            n_cur += 1;
-            ctx.decode(&mut batch)
-                .map_err(|e| InferError::StreamingFailure(format!("decode token: {e}")))?;
-        }
-
-        // tx drops here; channel is closed after last token.
-        Ok(rx)
     }
 
     /// Embeddings are not supported by generation backends.
@@ -358,10 +324,9 @@ impl InferenceBackend for LlamaBackend {
 // Internal helper: run a full completion without consuming a Mutex lock
 // ---------------------------------------------------------------------------
 
-/// Core generation loop shared by [`complete`] and (indirectly) [`extract`].
+/// Core generation loop shared by [`complete`], [`stream`], and [`extract`].
 ///
-/// `model` must be kept alive for the duration of this call by the caller
-/// (i.e. by holding the `MutexGuard`).
+/// `model` must outlive the generation call.
 fn run_complete(
     model: &LlamaModel,
     runtime: &LlamaCppBackend,
@@ -370,58 +335,89 @@ fn run_complete(
     warned_rotorquant_fallback: &AtomicBool,
     kv_quantizer: &Mutex<Option<KvQuantizer>>,
 ) -> Result<String, InferError> {
-    let ctx_size_nz = NonZeroU32::new(params.ctx_size)
-        .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
+    let mut result = String::new();
+    run_generation(
+        model,
+        runtime,
+        params,
+        default_kv_cache,
+        warned_rotorquant_fallback,
+        kv_quantizer,
+        || {},
+        |piece| {
+            result.push_str(&piece);
+            true
+        },
+    )
+    .map_err(InferError::InferenceFailure)?;
+
+    Ok(result)
+}
+
+fn run_generation(
+    model: &LlamaModel,
+    runtime: &LlamaCppBackend,
+    params: &InferenceParams,
+    default_kv_cache: KvCacheConfig,
+    warned_rotorquant_fallback: &AtomicBool,
+    kv_quantizer: &Mutex<Option<KvQuantizer>>,
+    mut on_ready: impl FnMut(),
+    mut emit_piece: impl FnMut(String) -> bool,
+) -> Result<(), String> {
     let active_kv = active_kv_config(params.kv_cache, default_kv_cache);
+    let ctx_params = context_params_for_request(params.ctx_size, active_kv)?;
     maybe_warn_rotorquant_fallback(warned_rotorquant_fallback, active_kv);
-    let ctx_params = with_kv_cache_types(
-        LlamaContextParams::default().with_n_ctx(Some(ctx_size_nz)),
-        active_kv,
-    );
     let mut ctx = model
         .new_context(runtime, ctx_params)
-        .map_err(|e| InferError::InferenceFailure(format!("context init: {e}")))?;
+        .map_err(|e| format!("context init: {e}"))?;
 
     let tokens_list = model
         .str_to_token(&params.prompt, AddBos::Always)
-        .map_err(|e| InferError::InferenceFailure(format!("tokenize: {e}")))?;
+        .map_err(|e| format!("tokenize: {e}"))?;
 
     if tokens_list.is_empty() {
-        return Err(InferError::InferenceFailure("empty prompt".into()));
+        return Err("empty prompt".into());
     }
 
-    let n_tokens = tokens_list.len() as i32;
-    let n_len = n_tokens + params.max_tokens as i32;
-    let n_ctx_val = params.ctx_size as i32;
+    let n_tokens = i32::try_from(tokens_list.len())
+        .map_err(|_| format!("prompt token count exceeds i32::MAX: {}", tokens_list.len()))?;
+    let max_tokens = i32::try_from(params.max_tokens)
+        .map_err(|_| format!("max_tokens exceeds i32::MAX: {}", params.max_tokens))?;
+    let n_len = n_tokens + max_tokens;
+    let n_ctx_val = i32::try_from(params.ctx_size)
+        .map_err(|_| format!("ctx_size exceeds i32::MAX: {}", params.ctx_size))?;
 
     if n_len > n_ctx_val {
-        return Err(InferError::InferenceFailure(format!(
+        return Err(format!(
             "prompt ({n_tokens} tokens) + max_tokens ({}) exceeds context size ({n_ctx_val})",
             params.max_tokens
-        )));
+        ));
     }
 
     let mut batch = LlamaBatch::new(tokens_list.len(), 1);
     let last_index = n_tokens - 1;
     for (i, &token) in tokens_list.iter().enumerate() {
-        let is_last = i as i32 == last_index;
+        let pos = i32::try_from(i).map_err(|_| format!("prompt position exceeds i32::MAX: {i}"))?;
+        let is_last = pos == last_index;
         batch
-            .add(token, i as i32, &[0], is_last)
-            .map_err(|e| InferError::InferenceFailure(format!("batch add: {e}")))?;
+            .add(token, pos, &[0], is_last)
+            .map_err(|e| format!("batch add: {e}"))?;
     }
 
     ctx.decode(&mut batch)
-        .map_err(|e| InferError::InferenceFailure(format!("decode prompt: {e}")))?;
+        .map_err(|e| format!("decode prompt: {e}"))?;
+
+    let seed = (params.request_id.as_u128() & 0xFFFF_FFFF) as u32;
+    let mut sampler = build_sampler(params, seed);
+    sampler.accept_many(tokens_list.iter());
 
     let mut n_cur = batch.n_tokens();
-    let seed = (params.request_id.as_u128() & 0xFFFF_FFFF) as u32;
-    let mut sampler =
-        LlamaSampler::chain_simple([LlamaSampler::dist(seed), LlamaSampler::greedy()]);
-
-    let mut result = String::new();
     let mut decoder = UTF_8.new_decoder();
+    let mut stop_buffer = StopSequenceBuffer::new(&params.stop_sequences);
 
-    while n_cur <= n_len {
+    on_ready();
+
+    while n_cur < n_len {
         let token = select_token(
             &ctx,
             &mut sampler,
@@ -436,20 +432,85 @@ fn run_complete(
 
         let piece = model
             .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| InferError::InferenceFailure(format!("token to piece: {e}")))?;
-        result.push_str(&piece);
+            .map_err(|e| format!("token to piece: {e}"))?;
+
+        let should_stop = match stop_buffer.push(&piece) {
+            StopOutcome::Emit(chunk) => !chunk.is_empty() && !emit_piece(chunk),
+            StopOutcome::Stop(chunk) => {
+                if !chunk.is_empty() && !emit_piece(chunk) {
+                    true
+                } else {
+                    break;
+                }
+            }
+            StopOutcome::Wait => false,
+        };
+
+        if should_stop {
+            return Ok(());
+        }
 
         batch.clear();
         batch
             .add(token, n_cur, &[0], true)
-            .map_err(|e| InferError::InferenceFailure(format!("batch add token: {e}")))?;
+            .map_err(|e| format!("batch add token: {e}"))?;
 
         n_cur += 1;
         ctx.decode(&mut batch)
-            .map_err(|e| InferError::InferenceFailure(format!("decode token: {e}")))?;
+            .map_err(|e| format!("decode token: {e}"))?;
     }
 
-    Ok(result)
+    if let Some(tail) = stop_buffer.finish() {
+        let _ = emit_piece(tail);
+    }
+
+    Ok(())
+}
+
+fn build_sampler(params: &InferenceParams, seed: u32) -> LlamaSampler {
+    let mut samplers = Vec::new();
+
+    if params.repeat_penalty > 0.0 && (params.repeat_penalty - 1.0).abs() > f32::EPSILON {
+        samplers.push(LlamaSampler::penalties(
+            -1,
+            params.repeat_penalty,
+            0.0,
+            0.0,
+        ));
+    }
+
+    if params.top_k > 0 {
+        let top_k = params.top_k.min(i32::MAX as u32) as i32;
+        samplers.push(LlamaSampler::top_k(top_k));
+    }
+
+    let top_p = params.top_p.clamp(0.0, 1.0);
+    if top_p < 1.0 {
+        samplers.push(LlamaSampler::top_p(top_p.max(f32::MIN_POSITIVE), 1));
+    }
+
+    if params.temperature > 0.0 {
+        samplers.push(LlamaSampler::temp(params.temperature));
+        samplers.push(LlamaSampler::dist(seed));
+    } else {
+        samplers.push(LlamaSampler::greedy());
+    }
+
+    LlamaSampler::chain_simple(samplers)
+}
+
+fn context_params_for_request(
+    ctx_size: u32,
+    active_kv: KvCacheConfig,
+) -> Result<LlamaContextParams, String> {
+    let ctx_size_nz = NonZeroU32::new(ctx_size)
+        .unwrap_or_else(|| NonZeroU32::new(2048).expect("constant 2048 is nonzero"));
+    let ctx_window = ctx_size_nz.get();
+    let params = LlamaContextParams::default()
+        .with_n_ctx(Some(ctx_size_nz))
+        .with_n_batch(ctx_window)
+        .with_n_ubatch(ctx_window);
+    with_kv_cache_types(params, active_kv)
 }
 
 fn select_token(
@@ -458,7 +519,7 @@ fn select_token(
     last_index: i32,
     active_kv: KvCacheConfig,
     kv_quantizer: &Mutex<Option<KvQuantizer>>,
-) -> Result<LlamaToken, InferError> {
+) -> Result<LlamaToken, String> {
     if !active_kv.is_enabled() {
         let token = sampler.sample(ctx, last_index);
         sampler.accept(token);
@@ -469,7 +530,7 @@ fn select_token(
     let logits = ctx.get_logits();
     let mut guard = kv_quantizer
         .lock()
-        .map_err(|_| InferError::InferenceFailure("kv quantizer mutex poisoned".into()))?;
+        .map_err(|_| "kv quantizer mutex poisoned".to_string())?;
     let recreate = guard
         .as_ref()
         .map(|q| q.config() != active_kv)
@@ -481,17 +542,20 @@ fn select_token(
     quantizer.set_config(active_kv);
 
     let compressed = quantizer.compress_k(logits);
-    let reconstructed = quantizer.decompress(&compressed, active_kv.k);
+    let reconstructed = quantizer.decompress(&compressed);
+    let mut candidates = LlamaTokenDataArray::from_iter(
+        reconstructed.iter().enumerate().map(|(index, &logit)| {
+            LlamaTokenData::new(LlamaToken::new(index as i32), logit, 0.0)
+        }),
+        false,
+    );
+    candidates.apply_sampler(sampler);
 
-    let mut best_idx = 0usize;
-    let mut best_val = f32::MIN;
-    for (i, &v) in reconstructed.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    Ok(LlamaToken::new(best_idx as i32))
+    let token = candidates
+        .selected_token()
+        .ok_or_else(|| "sampler failed to select token".to_string())?;
+    sampler.accept(token);
+    Ok(token)
 }
 
 fn active_kv_config(request: KvCacheConfig, default_cfg: KvCacheConfig) -> KvCacheConfig {
@@ -502,17 +566,27 @@ fn active_kv_config(request: KvCacheConfig, default_cfg: KvCacheConfig) -> KvCac
     }
 }
 
-fn with_kv_cache_types(mut params: LlamaContextParams, cfg: KvCacheConfig) -> LlamaContextParams {
-    params = params.with_type_k(map_quant_to_kv_type(cfg.k));
-    params.with_type_v(map_quant_to_kv_type(cfg.v))
+fn with_kv_cache_types(
+    mut params: LlamaContextParams,
+    cfg: KvCacheConfig,
+) -> Result<LlamaContextParams, String> {
+    params = params.with_type_k(map_quant_to_kv_type(cfg.k)?);
+    Ok(params.with_type_v(map_quant_to_kv_type(cfg.v)?))
 }
 
-fn map_quant_to_kv_type(quant: KvQuantization) -> KvCacheType {
+fn map_quant_to_kv_type(quant: KvQuantization) -> Result<KvCacheType, String> {
     match quant {
-        KvQuantization::None => KvCacheType::F16,
-        KvQuantization::Planar2 => KvCacheType::TQ2_0,
-        KvQuantization::Planar3 | KvQuantization::Iso3 => KvCacheType::Q3_K,
-        KvQuantization::Iso4 => KvCacheType::Q4_K,
+        KvQuantization::None => Ok(KvCacheType::F16),
+        KvQuantization::Rotor(crate::kv_quant::RotorQuantization::Planar2) => Ok(KvCacheType::TQ2_0),
+        KvQuantization::Rotor(
+            crate::kv_quant::RotorQuantization::Planar3
+            | crate::kv_quant::RotorQuantization::Iso3,
+        ) => Ok(KvCacheType::Q3_K),
+        KvQuantization::Rotor(crate::kv_quant::RotorQuantization::Iso4) => Ok(KvCacheType::Q4_K),
+        KvQuantization::Turbo(turbo) => Err(format!(
+            "TurboQuant {:?} is not supported by the current llama.cpp native KV dtype mapping; software-managed KV cache integration is still pending",
+            turbo
+        )),
     }
 }
 
@@ -522,7 +596,7 @@ fn maybe_warn_rotorquant_fallback(warned: &AtomicBool, cfg: KvCacheConfig) {
     }
     warned.store(true, Ordering::Relaxed);
     tracing::warn!(
-        "RotorQuant-specific KV tensor hooks are unavailable in this llama-cpp-2 integration; using llama.cpp native KV dtype mapping via context type_k/type_v and degraded logits quantization fallback"
+        "RotorQuant-style KV tensor hooks are unavailable in this llama-cpp-2 integration; using llama.cpp native KV dtype mapping via context type_k/type_v and degraded logits quantization fallback"
     );
 }
 

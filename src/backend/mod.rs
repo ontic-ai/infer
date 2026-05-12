@@ -12,6 +12,7 @@ pub mod embed;
 #[cfg(feature = "llama")]
 pub mod llama;
 pub mod mock;
+mod stop;
 
 use crate::error::InferError;
 use crate::kv_quant::KvCacheConfig;
@@ -150,12 +151,18 @@ pub struct InferenceParams {
     pub prompt: String,
     /// Sampling temperature (0.0 = deterministic, 1.0 = creative).
     pub temperature: f32,
+    /// Top-k sampling limit (0 disables the filter).
+    pub top_k: u32,
     /// Top-p nucleus sampling threshold.
     pub top_p: f32,
+    /// Repeat penalty applied against the accepted token history (1.0 disables it).
+    pub repeat_penalty: f32,
     /// Maximum number of tokens to generate.
     pub max_tokens: usize,
     /// Context window size in tokens.
     pub ctx_size: u32,
+    /// Stop sequences that terminate generation before the matching text is emitted.
+    pub stop_sequences: Vec<String>,
     /// KV cache quantization applied during this inference call.
     /// Defaults to no quantization (FP16 K and V).
     pub kv_cache: KvCacheConfig,
@@ -167,9 +174,12 @@ impl Default for InferenceParams {
             request_id: uuid::Uuid::new_v4(),
             prompt: String::new(),
             temperature: 0.7,
+            top_k: 40,
             top_p: 0.9,
+            repeat_penalty: 1.0,
             max_tokens: 512,
             ctx_size: 2048,
+            stop_sequences: Vec::new(),
             kv_cache: KvCacheConfig::none(),
         }
     }
@@ -259,8 +269,6 @@ pub trait InferenceBackend: Send + Sync + 'static {
     /// Returns a [`mpsc::Receiver<String>`]. Tokens arrive on the channel as
     /// they are decoded; the channel is closed when generation finishes or
     /// when the receiver is dropped (cancellation).
-    ///
-    /// **Independent code path from [`complete`](InferenceBackend::complete).**
     fn stream(&self, params: InferenceParams) -> Result<mpsc::Receiver<String>, InferError>;
 
     /// Generate an embedding vector for `text`.
@@ -285,8 +293,18 @@ mod tests {
     }
 
     #[test]
+    fn inference_params_default_top_k() {
+        assert_eq!(InferenceParams::default().top_k, 40);
+    }
+
+    #[test]
     fn inference_params_default_top_p() {
         assert_eq!(InferenceParams::default().top_p, 0.9);
+    }
+
+    #[test]
+    fn inference_params_default_repeat_penalty() {
+        assert_eq!(InferenceParams::default().repeat_penalty, 1.0);
     }
 
     #[test]
@@ -297,6 +315,11 @@ mod tests {
     #[test]
     fn inference_params_default_ctx_size() {
         assert_eq!(InferenceParams::default().ctx_size, 2048);
+    }
+
+    #[test]
+    fn inference_params_default_stop_sequences() {
+        assert!(InferenceParams::default().stop_sequences.is_empty());
     }
 
     #[test]

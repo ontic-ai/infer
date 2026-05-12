@@ -8,7 +8,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::thread;
 
+use super::stop::{StopOutcome, StopSequenceBuffer, trim_to_stop_sequence};
 use crate::backend::{BackendType, ExtractionResult, InferenceBackend, InferenceParams};
 use crate::error::InferError;
 
@@ -113,7 +115,7 @@ impl InferenceBackend for MockBackend {
         self.model_name_loaded.as_deref()
     }
 
-    fn complete(&self, _params: &InferenceParams) -> Result<String, InferError> {
+    fn complete(&self, params: &InferenceParams) -> Result<String, InferError> {
         if !self.loaded {
             return Err(InferError::BackendNotInitialized);
         }
@@ -123,7 +125,10 @@ impl InferenceBackend for MockBackend {
             ));
         }
         self.infer_call_count.fetch_add(1, Ordering::Relaxed);
-        Ok(self.config.infer_response.clone())
+        Ok(trim_to_stop_sequence(
+            &self.config.infer_response,
+            &params.stop_sequences,
+        ))
     }
 
     /// Stream tokens by splitting the fixed response into words.
@@ -131,7 +136,7 @@ impl InferenceBackend for MockBackend {
     /// Each word (except the first) is prefixed with a space so that
     /// `tokens.collect::<String>()` reproduces the original response exactly.
     /// The output is fully deterministic: same configuration → same token sequence.
-    fn stream(&self, _params: InferenceParams) -> Result<mpsc::Receiver<String>, InferError> {
+    fn stream(&self, params: InferenceParams) -> Result<mpsc::Receiver<String>, InferError> {
         if !self.loaded {
             return Err(InferError::BackendNotInitialized);
         }
@@ -142,19 +147,44 @@ impl InferenceBackend for MockBackend {
         }
 
         let response = self.config.infer_response.clone();
+        let stop_sequences = params.stop_sequences;
         let (tx, rx) = mpsc::channel::<String>();
 
-        for (i, word) in response.split_whitespace().enumerate() {
-            let token = if i == 0 {
-                word.to_string()
-            } else {
-                format!(" {}", word)
-            };
-            if tx.send(token).is_err() {
-                break; // receiver dropped — clean cancellation
-            }
-        }
-        // tx dropped here; channel closes after the last token.
+        thread::Builder::new()
+            .name("infer-mock-stream".to_string())
+            .spawn(move || {
+                let mut stop_buffer = StopSequenceBuffer::new(&stop_sequences);
+
+                for (i, word) in response.split_whitespace().enumerate() {
+                    let token = if i == 0 {
+                        word.to_string()
+                    } else {
+                        format!(" {}", word)
+                    };
+
+                    let should_stop = match stop_buffer.push(&token) {
+                        StopOutcome::Emit(chunk) => !chunk.is_empty() && tx.send(chunk).is_err(),
+                        StopOutcome::Stop(chunk) => {
+                            if !chunk.is_empty() && tx.send(chunk).is_err() {
+                                true
+                            } else {
+                                break;
+                            }
+                        }
+                        StopOutcome::Wait => false,
+                    };
+
+                    if should_stop {
+                        return;
+                    }
+                }
+
+                if let Some(tail) = stop_buffer.finish() {
+                    let _ = tx.send(tail);
+                }
+            })
+            .map_err(|e| InferError::StreamingFailure(format!("spawn: {e}")))?;
+
         Ok(rx)
     }
 
@@ -250,6 +280,27 @@ mod tests {
         let tokens: Vec<String> = rx.iter().collect();
         // "Mock inference response" splits into 3 words
         assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn complete_respects_stop_sequences() {
+        let params = InferenceParams {
+            stop_sequences: vec!["response".to_string()],
+            ..InferenceParams::default()
+        };
+
+        assert_eq!(loaded().complete(&params).expect("complete"), "Mock inference ");
+    }
+
+    #[test]
+    fn stream_respects_stop_sequences() {
+        let params = InferenceParams {
+            stop_sequences: vec!["response".to_string()],
+            ..InferenceParams::default()
+        };
+        let rx = loaded().stream(params).expect("stream");
+
+        assert_eq!(rx.iter().collect::<String>(), "Mock inference ");
     }
 
     #[test]
