@@ -20,9 +20,9 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
-use llama_cpp_2::token::LlamaToken;
 
 use super::stop::{StopOutcome, StopSequenceBuffer};
 use crate::backend::{BackendType, ExtractionResult, InferenceBackend, InferenceParams};
@@ -471,12 +471,7 @@ fn build_sampler(params: &InferenceParams, seed: u32) -> LlamaSampler {
     let mut samplers = Vec::new();
 
     if params.repeat_penalty > 0.0 && (params.repeat_penalty - 1.0).abs() > f32::EPSILON {
-        samplers.push(LlamaSampler::penalties(
-            -1,
-            params.repeat_penalty,
-            0.0,
-            0.0,
-        ));
+        samplers.push(LlamaSampler::penalties(-1, params.repeat_penalty, 0.0, 0.0));
     }
 
     if params.top_k > 0 {
@@ -544,9 +539,10 @@ fn select_token(
     let compressed = quantizer.compress_k(logits);
     let reconstructed = quantizer.decompress(&compressed);
     let mut candidates = LlamaTokenDataArray::from_iter(
-        reconstructed.iter().enumerate().map(|(index, &logit)| {
-            LlamaTokenData::new(LlamaToken::new(index as i32), logit, 0.0)
-        }),
+        reconstructed
+            .iter()
+            .enumerate()
+            .map(|(index, &logit)| LlamaTokenData::new(LlamaToken::new(index as i32), logit, 0.0)),
         false,
     );
     candidates.apply_sampler(sampler);
@@ -577,10 +573,11 @@ fn with_kv_cache_types(
 fn map_quant_to_kv_type(quant: KvQuantization) -> Result<KvCacheType, String> {
     match quant {
         KvQuantization::None => Ok(KvCacheType::F16),
-        KvQuantization::Rotor(crate::kv_quant::RotorQuantization::Planar2) => Ok(KvCacheType::TQ2_0),
+        KvQuantization::Rotor(crate::kv_quant::RotorQuantization::Planar2) => {
+            Ok(KvCacheType::TQ2_0)
+        }
         KvQuantization::Rotor(
-            crate::kv_quant::RotorQuantization::Planar3
-            | crate::kv_quant::RotorQuantization::Iso3,
+            crate::kv_quant::RotorQuantization::Planar3 | crate::kv_quant::RotorQuantization::Iso3,
         ) => Ok(KvCacheType::Q3_K),
         KvQuantization::Rotor(crate::kv_quant::RotorQuantization::Iso4) => Ok(KvCacheType::Q4_K),
         KvQuantization::Turbo(turbo) => Err(format!(

@@ -67,10 +67,8 @@ pub(crate) fn trim_to_stop_sequence(text: &str, stop_sequences: &[String]) -> St
         StopOutcome::Wait => false,
     };
 
-    if !stopped {
-        if let Some(tail) = buffer.finish() {
-            result.push_str(&tail);
-        }
+    if !stopped && let Some(tail) = buffer.finish() {
+        result.push_str(&tail);
     }
 
     result

@@ -289,7 +289,10 @@ mod tests {
             ..InferenceParams::default()
         };
 
-        assert_eq!(loaded().complete(&params).expect("complete"), "Mock inference ");
+        assert_eq!(
+            loaded().complete(&params).expect("complete"),
+            "Mock inference "
+        );
     }
 
     #[test]
