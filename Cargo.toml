@@ -1,6 +1,6 @@
 [package]
 name = "infer"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["Ontic AI <dev@ontic.ai>"]
 license = "MIT"
@@ -27,20 +27,20 @@ metal = ["llama", "llama-cpp-2/metal"]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1.52.3", features = ["sync"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4"] }
 turboquant = "0.1.1"
-llama-cpp-2 = { version = "0.1.143", optional = true }
+llama-cpp-2 = { version = "0.1.146", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 
 [build-dependencies]
-shaderc = "0.8"
+shaderc = "0.10.1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "kv_quant"

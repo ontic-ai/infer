@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-11
+
+- Updated direct dependencies to the latest published releases for `tokio`, `uuid`, `llama-cpp-2`, `criterion`, and `shaderc`.
+
 ## [0.3.0] - 2026-05-11
 
 - Added `InferenceParams::top_k`, `InferenceParams::repeat_penalty`, and `InferenceParams::stop_sequences` for explicit sampler and stop control.
